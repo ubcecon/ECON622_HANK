@@ -1,5 +1,5 @@
 using Documenter
-using .HANK
+using HANK
 
 makedocs(sitename="HANK")
 
