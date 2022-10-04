@@ -1,0 +1,7 @@
+name = "HANK"
+uuid = "6cd6be85-160c-4f8d-9bdf-f031c6f0aa81"
+authors = ["Paul Schrimpf <paul.schrimpf@ubc.ca>"]
+version = "0.1.0"
+
+[deps]
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
