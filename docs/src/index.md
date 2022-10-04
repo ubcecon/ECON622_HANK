@@ -12,6 +12,7 @@ Order   = [:type, :function]
 ```
 
 ```jldoctest
+using HANK
 x = [1, 10]
 totest(x)
 # output
