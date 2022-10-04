@@ -6,3 +6,7 @@
         @test totest(x) ≈ sum(x)
     end
 end
+
+@testset "Broken" begin
+    @test totest([1]) ≈ 2
+end
