@@ -1,5 +1,7 @@
  # Model Description
 
+This is based on section II of the paper.
+
  ## Households
 
 ```math
@@ -38,6 +40,15 @@ P_t = \left( \int_0^1 p_{j,t}^{1-\epsilon} dj \right)^{\frac{1}{1-\epsilon}}
 
 ## Intermediate Goods
 
+
+```math
+y_{j,t} = k_{j,t}^\alpha n_{j,t}^{1-\alpha}
+```
+given ``r_t^k`` and ``w_t`` minimize costs. Implies marginal costs
+```math
+m_t = \left( \frac{r_t^k}{\alpha} \right)^\alpah \left( \frac{w_t}{1-\alpha} \right)^{1-\alpha}
+```
+
 ```math
 \max_{p_t} \int_0^\infty e^{\int_0^t r_s^a ds} \underbrace{\left[ \tilde{\Pi}(p_t) - \Theta\left(\frac{\dot{p}_t}{p_t} \right) \right]}_{\Pi_t} dt
 ```
@@ -45,13 +56,9 @@ where
 ```math
 \Theta\left(\frac{\dot{p}_t}{p_t} \right) = \frac{\theta}{2}\left(\frac{\dot{p}_t}{p_t}\right)^2 Y_t
 ```
-,
-```math
-\tilde{\Pi}(p_t) = \left( \frac{p_t}{P_t} - m_t \right) \left(\frac{p_t}{P_t} \right)^{-\epsilon} Y_t
-```
 and
 ```math
-m_t = \left( \frac{r_t^k}{\alpha} \right)^\alpah \left( \frac{w_t}{1-\alpha} \right)^{1-\alpha}
+\tilde{\Pi}(p_t) = \left( \frac{p_t}{P_t} - m_t \right) \left(\frac{p_t}{P_t} \right)^{-\epsilon} Y_t
 ```
 
 ## Illiquid Walth
@@ -92,3 +99,7 @@ N_t = & \int z \ell_t(a,b,z) d\mu_t \\
 Y_t = & C_t + I_t + G_t + \Theta_t + \chi_t + \kappa \int\max\{-b, 0\} d\mu_t
 \end{aligned}
 ```
+
+## Equilibrium
+
+Values of ``\{a_t, b_t, c_t, d_t, \ell_t, n_t, k_t\}``, prices ``\{w_t, r_t^k\}``, returns ``\{r_t^b, r_t^a\}``, share prices ``\{q_t\}``, inflation ``\pi_t = \dot{p}_t/P_t``, fiscal variables ``\{\tau_t, T_t, G_t, B_t \}``, agent distribution ``\mu_t``, s.t. houses and firms maximize, markets clear, government budget balances, and sequence of distributions satisfy aggregate consistency conditions
