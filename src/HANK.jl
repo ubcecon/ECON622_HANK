@@ -17,4 +17,7 @@ function totest(x)
     return(sum(x))
 end
 
+include("optimalcontrol.jl")
+
+
 end
