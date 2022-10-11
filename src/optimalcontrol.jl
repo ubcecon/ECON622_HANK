@@ -22,10 +22,10 @@ Solves the infinity horizon optimal control problem.
 
 ```{math}
 \\begin{aligned}
-\\max_z &  ∫_0^∞ e^{-rt} F(z(t)) dt \\\\
+\\max_{z,c} &  ∫_0^∞ e^{-rt} F(z(t), c(t)) dt \\\\
 & s.t. \\\\
-0 = & G(z(t), \\dot{z}(t)) \\\\
-L \\leq & z(t) \\leq U \\\\
+\\dot{z}(t) = & G(z(t), c(t)) \\\\
+L \\leq & (c(t), z(t))' \\leq U \\\\
 Z_0 = & z(0)
 \\end{aligned}
 ```
@@ -36,7 +36,8 @@ struct OCProblem{TF, TG, Tbound, Tinitial,Tr}
     G::TG
     L::Tbound
     U::Tbound
-    dim::Int
+    dimz::Int
+    dimc::Int
     z0::Tinitial
     r::Tr
 end
@@ -47,7 +48,8 @@ convert OCProblem to InfiniteOpt.InfininteModel
 """
 function convert(::Type{InfiniteOpt.InfiniteModel}, oc::OCProblem)
     r = oc.r
-    d = oc.dim
+    dz = oc.dimz
+    dc = oc.dimc
     z0 = oc.z0
     F = oc.F 
     G = oc.G     
@@ -56,20 +58,29 @@ function convert(::Type{InfiniteOpt.InfiniteModel}, oc::OCProblem)
     #hi = quantile(Exponential(1/r),tmass)
     #t = InfiniteOpt.@infinite_parameter(m, t ~ Truncated(Exponential(1/r),0.0, hi))
     t = InfiniteOpt.@infinite_parameter(m, t ~ Exponential(1/r))
-    z = InfiniteOpt.@variable(m, z[i = 1:d], InfiniteOpt.Infinite(t))
-    for i ∈ 1:d
+    z = InfiniteOpt.@variable(m, z[i = 1:dz], InfiniteOpt.Infinite(t))
+    c = InfiniteOpt.@variable(m, c[i = 1:dc], InfiniteOpt.Infinite(t))
+    for i ∈ 1:dz
+        if isfinite(oc.L[i+dc]) 
+            InfiniteOpt.set_lower_bound(z[i], oc.L[i+dc])
+        end
+        if isfinite(oc.U[i+dc]) 
+            InfiniteOpt.set_upper_bound(z[i], oc.U[i+dc])
+        end
+    end
+    for i ∈ 1:dc
         if isfinite(oc.L[i]) 
-            InfiniteOpt.set_lower_bound(z[i], oc.L[i])
+            InfiniteOpt.set_lower_bound(c[i], oc.L[i])
         end
         if isfinite(oc.U[i]) 
-            InfiniteOpt.set_upper_bound(z[i], oc.U[i])
+            InfiniteOpt.set_upper_bound(c[i], oc.U[i])
         end
     end
 
     
-    obj = InfiniteOpt.@objective(m, Max, InfiniteOpt.@expect(F(z)/r,t))
+    obj = InfiniteOpt.@objective(m, Max, InfiniteOpt.@expect(F(z,c)/r,t))
     
-    con = InfiniteOpt.@constraint(m, G(z,[InfiniteOpt.deriv(z[i],t) for i ∈ 1:d])==0)
+    con = InfiniteOpt.@constraint(m,[InfiniteOpt.deriv(z[i],t) for i in 1:dz] .== G(z,c))
 
     for (i,z0i) ∈ enumerate(z0)
         if !isnothing(z0i)
@@ -101,95 +112,79 @@ function solve_InfiniteOpt(p::OCProblem; optimizer=Ipopt.Optimizer, nsupport=not
     InfiniteOpt.optimize!(m)
     status = InfiniteOpt.termination_status(m)    
     ts = InfiniteOpt.supports(InfiniteOpt.parameter_by_name(m,"t"))
-    Z = zeros(p.dim, length(ts))
-    for i ∈ 1:p.dim
+    Z = zeros(p.dimz, length(ts))
+    for i ∈ 1:p.dimz
         Z[i,:] = InfiniteOpt.value(InfiniteOpt.variable_by_name(m,"z[$i]"))
     end
+    C = zeros(p.dimc, length(ts))
+    for i ∈ 1:p.dimc
+        C[i,:] = InfiniteOpt.value(InfiniteOpt.variable_by_name(m,"c[$i]"))
+    end
+    
     opt_obj = InfiniteOpt.objective_value(m)
-    return(obj=opt_obj, Z=Z, t=ts, status=status)
+    return(obj=opt_obj, Z=Z, C=C, t=ts, status=status)
 end
 
 
 import DiffEqFlux, FastGaussQuadrature, Lux, Zygote, SciMLSensitivity, Random
-import DifferentialEquations: DAEFunction, DAEProblem # change to scimlbase?
+import DifferentialEquations: ODEFunction, ODEProblem # change to scimlbase?
 import DifferentialEquations
 
-function createode(p::OCProblem, m, st; controls=1:(p.dim÷2), states=setdiff(1:p.dim, controls), tmax=5/p.r)
-    θ = Lux.initialparameters(Random.default_rng(), m)
+function createode(p::OCProblem, θ, m, st;  tmax=5/p.r)
     _, re  = Lux.destructure(θ)
-    function f!(resid, du, u, θ, t)
-        z = Vector{eltype(u)}(undef,p.dim)
-        dotz = Vector{eltype(du)}(undef,p.dim)
-        z[controls] .= first(m([t], re(θ), st))
-        z[states] .= u
-        dotz[controls] .= NaN
-        dotz[states] .= du
-        resid .= p.G(z,dotz)        
+    function f!(dz, z, θ::AbstractArray, t)
+        c = first(m([t], re(θ), st))
+        dz .= p.G(z,c)        
     end
-    dae_f = DAEFunction(f!)
-    odeprob(θ::AbstractArray) = DAEProblem(dae_f, [0.0], p.z0[states], (0,tmax), p=θ)    
-    odeprob(θ::NamedTuple) = DAEProblem(dae_f, [0.0], p.z0[states], (0,tmax), p=Lux.destructure(θ)[1])        
+    ode_f = ODEFunction(f!)
+    odeprob(a::AbstractArray) = ODEProblem(ode_f, p.z0, (0,tmax), a)    
+    odeprob(tp::NamedTuple) = ODEProblem(ode_f, p.z0, (0,tmax), Lux.destructure(tp)[1])        
     return(odeprob)
 end
 
-function controlmodel(p::OCProblem; controls=1:(p.dim ÷ 2), width=32)
-    L = p.L[controls]
-    U = p.U[controls]
-    function maketransform(c)
-        out = Vector{Function}(undef, length(c))
-        for i ∈ eachindex(c)
-            if isfinite(L[i]) && isfinite(U[i]) 
-                out[i] = x->(L[i] + (U[i]-L[i])/(1+exp(x)))
-            elseif isfinite(L[i])
-                out[i] = x->(L[i] + exp(x))
-            elseif isfinite(U[i])
-                out[i] = x->(-exp(x) + U[i])
-            else    
-                out[i] = x->x
-            end
+function controlmodel(p::OCProblem; width=32)
+    L = p.L
+    U = p.U
+    out = Vector{Function}(undef, p.dimc)
+    for i ∈ 1:p.dimc
+        if isfinite(L[i]) && isfinite(U[i]) 
+            out[i] = x->(L[i] + (U[i]-L[i])/(1+exp(x)))
+        elseif isfinite(L[i])
+            out[i] = x->(L[i] + exp(x))
+        elseif isfinite(U[i])
+            out[i] = x->(-exp(x) + U[i])
+        else    
+            out[i] = x->x
         end
-
-        return(c->[f(x) for (f,x) ∈ zip(out,c)])
-    end
-    constraindomain = maketransform(controls)
+    end    
+    constraindomain = c->[f(x) for (f,x) ∈ zip(out,c)]
 
     
     m = Lux.Chain( 
             Lux.Dense(1, width, DiffEqFlux.relu),
-            Lux.Dense(width, length(controls)) ,
+            Lux.Dense(width, p.dimc) ,
             constraindomain)        
     return(m)
 end
 
-function solveode(odeprob, θ; nint=100, r=0.05)
+function solveode(odeprob; nint=100, r=0.05)
     t , ert = FastGaussQuadrature.gausslaguerre(nint)
     ert .*= r
     t .*= r    
-    sol=DifferentialEquations.solve(odeprob, DifferentialEquations.DImplicitEuler(), p=θ,saveat=t)
+    sol=DiffEqFlux.solve(odeprob, saveat=t)
     return(sol)
 end
-solveode(p::OCProblem,θ, m, st) = solveode(createode(p, m, st)(θ))
 
-import Base: length
-struct Control{T}
-    m::T
-end
-(c::Control)(t) = c.m([t])
-length(c::Control) = 100+sum(length(s) for s ∈ Flux.params(c.m)) # any number > 100 to trigger reverse mode 
-
-function traincontrol!(θ, st, m, ocp; nint=100, iterations=100)    
+function traincontrol(θ, st, m, ocp; nint=100, iterations=100)    
     t , ert = FastGaussQuadrature.gausslaguerre(nint)
     ert .*= ocp.r
     t .*= ocp.r 
-    odesolver = DifferentialEquations.DImplicitEuler()
-    ode = createode(ocp,m, st)(θ)
+    ode = createode(ocp,θ, m, st)
     function loss(m, θ, st) 
-        sol = DifferentialEquations.solve(ode, odesolver, p=Lux.destructure(θ)[1],saveat=t
+        sol = DiffEqFlux.solve(ode(Lux.destructure(θ)[1]),saveat=t
             #,sensealg=SciMLSensitivity.QuadratureAdjoint()
             )[1,:]
-        #sum(ocp.F(vcat(m([τ]), sol(τ)))*w for (τ,w) ∈ zip(t, ert))        
-        #sum(sum(vcat(m([τ])))*w for (τ,w,s) ∈ zip(t, ert, sol))
-        l = sum(-ocp.F(vcat(first(m([s], θ, st)),s))*w for (τ, w, s) ∈ zip(t,ert,sol))
+        l = sum(-ocp.F(vcat(first(m([τ], θ, st)),s))*w + 10*(Lux.relu(-s)) for (τ, w, s) ∈ zip(t,ert,sol))
         return(l)
     end
     opt= Lux.Optimisers.setup(Lux.Optimisers.ADAM(0.1f0), θ)
