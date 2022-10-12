@@ -148,7 +148,7 @@ function controlmodel(p::OCProblem; width=32)
     out = Vector{Function}(undef, p.dimc)
     for i ∈ 1:p.dimc
         if isfinite(L[i]) && isfinite(U[i]) 
-            out[i] = x->(L[i] + (U[i]-L[i])/(1+exp(x)))
+            out[i] = x->(L[i] + (U[i]-L[i])/(1+exp(-x)))
         elseif isfinite(L[i])
             out[i] = x->(L[i] + exp(x))
         elseif isfinite(U[i])
@@ -175,24 +175,27 @@ function solveode(odeprob; nint=100, r=0.05)
     return(sol)
 end
 
-function traincontrol(θ, st, m, ocp; nint=100, iterations=100)    
+relaxedlogbarrier(z,δ) = (z<δ) ? (exp(1-z/δ) - 1 - log(δ)) : -log(z)
+
+
+function traincontrol(θ, st, m, ocp; nint=100, iterations=100, δ=0.1,μ=1.0,
+        opt= Lux.Optimisers.setup(Lux.Optimisers.ADAM(0.1f0), θ))    
     t , ert = FastGaussQuadrature.gausslaguerre(nint)
     ert .*= ocp.r
     t .*= ocp.r 
     ode = createode(ocp,θ, m, st)
+    il = [i for i ∈ 1:ocp.dimz if isfinite(ocp.L[ocp.dimc+i])]
+    iu = [i for i ∈ 1:ocp.dimz if isfinite(ocp.U[ocp.dimc+i])]
+    penalty(z) = μ*(sum(relaxedlogbarrier.(z[i] - ocp.L[ocp.dimc+i], δ) for i ∈ il) + 
+        sum(relaxedlogbarrier.(-z[i] + ocp.U[ocp.dimc+i], δ) for i ∈ iu)) 
     function loss(m, θ, st) 
         sol = DiffEqFlux.solve(ode(Lux.destructure(θ)[1]),saveat=t
             #,sensealg=SciMLSensitivity.QuadratureAdjoint()
             )[1,:]
-        l = sum(-ocp.F(vcat(first(m([τ], θ, st)),s))*w + 10*(Lux.relu(-s)) for (τ, w, s) ∈ zip(t,ert,sol))
+        l = sum(-ocp.F(s, first(m([τ], θ, st)))*w + penalty(s) for (τ, w, s) ∈ zip(t,ert,sol))
         return(l)
     end
-    opt= Lux.Optimisers.setup(Lux.Optimisers.ADAM(0.1f0), θ)
-    #opt = DiffEqFlux.ADAM(0.1)
-    #cb = function ()
-    #    display(loss())
-    #end
-    
+      
     ℓ = p -> loss(m, p, st)
     lval, back = Zygote.pullback(ℓ, θ)
     gs = back(one(lval))[1]
@@ -204,7 +207,7 @@ function traincontrol(θ, st, m, ocp; nint=100, iterations=100)
 
         println("Iter[$i]: obj=$(-lval)")
     end
-    return(θ, m, st)
+    return(θ, m, st, opt)
 end
 
 
