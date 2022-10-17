@@ -72,3 +72,18 @@ result = pdesolve(f, stategrid, yend)
 
 (V = result.optional[:V], Va =result.optional[:Va], Vb = result.optional[:Vb], Vy = result.optional[:Vy])    
 
+# Phillips Curve
+# u = [r_a(t) Y(t) P(t) π(t) m(t) r_b(t)] vector of functions
+# z = [ϵ θ rbfixed ϕ] vector of parameters
+function PhillipsCurve(du,u,z,t)
+    (u[1]- (du[2]/u[2]))*u[4] = (z[1]/z[2])*(u[5]- (z[1]-1)/z[1]) + du[4]
+    du[3]/u[3] = u[4]
+    u[6] = z[3] + (z[4]-1)*u[4] #Taylor rule
+
+   end
+#Goverment's Law of Motion 
+# u = [Bg(t) G(t) T(t) τ(t) w(t) l(t) rb(t)] vector of functions
+
+function Goverment(du,u,z,t)
+ du[1] + u[2] + u[3] = u[4]*∫(u[5]*z*u[6]) + u[7]*u[1]
+ end 
