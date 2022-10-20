@@ -168,9 +168,11 @@ function constraindomain(L,U, T=eltype(L))
     return(c->[f(x) for (f,x) ∈ zip(out,c)])
 end
 
-function controlmodel(p::OCProblem; width=32)
+function controlmodel(p::OCProblem; width=32, maxt=80.0/p.r)
     @views cons = constraindomain(p.L[1:p.dimc], p.U[1:p.dimc])
+    scalet = t->t/(maxt)*2
     m = Lux.Chain( 
+            scalet,
             Lux.Dense(1, width, Lux.relu),
             Lux.Dense(width, p.dimc) ,
             cons)        
@@ -220,26 +222,7 @@ function traincontrol(θ, st, m, ocp; nint=100, iterations=100, δ=0.1,μ=1.0,
     return(θ, m, st, opt)
 end
 
-
-
-function hamiltonianode(ocp)
-    dz = ocp.dimz
-    function f!(du, u, θ::AbstractArray, t)
-        c = evalm(t,z,m, re(θ),st)
-        du[1:dz] .= p.G(u[1:dz],c)        
-        λ = @view u[(dz+1):end]
-        dλ = @view du[(dz+1):end] 
-        dλ = -p.F
-        
-    end
-    ode_f = ODEFunction(f!)
-    odeprob(a::AbstractArray) = ODEProblem(ode_f, p.z0, (0,tmax), a)    
-    odeprob(tp::NamedTuple) = ODEProblem(ode_f, p.z0, (0,tmax), Lux.destructure(tp)[1])        
-    return(odeprob)
-end
-
 import FiniteDiff
-
 """
 
 Method of Mortezaee & Nazemi (2019)
@@ -280,7 +263,7 @@ function neuralcollocation(p, width; points=100, opt = nothing)
         ż .- p.G(z,c),
         FiniteDiff.finite_difference_gradient(c->H(t,z,c,λ),c,Val(:central), eltype(c), Val(false)),
         #ForwardDiff.gradient(c->H(t,z,c,λ),c),
-        λ̇ + FiniteDiff.finite_difference_gradient(z->H(t,z,c,λ),z,Val(:central), eltype(z), Val(false))
+        #λ̇ + FiniteDiff.finite_difference_gradient(z->H(t,z,c,λ),z,Val(:central), eltype(z), Val(false))
            # ForwardDiff.gradient(z->H(t,z,c,λ),z)
         ]
     RType = eltype(θc.layer_2.bias)
