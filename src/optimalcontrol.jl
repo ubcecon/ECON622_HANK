@@ -43,6 +43,9 @@ struct OCProblem{TF, TG, Tbound, Tinitial,Tr}
 end
 
 
+hamiltonian(p) = (t,z,c,λ)->exp(-p.r*t)*p.F(z,c) + λ'*p.G(z,c)
+
+
 """
 convert OCProblem to InfiniteOpt.InfininteModel
 """
@@ -54,10 +57,10 @@ function convert(::Type{InfiniteOpt.InfiniteModel}, oc::OCProblem)
     F = oc.F 
     G = oc.G     
     m = InfiniteOpt.InfiniteModel()
-    #tmass = 0.99
-    #hi = quantile(Exponential(1/r),tmass)
+    tmass = 0.99
+    hi = quantile(Exponential(1/r),tmass)
     #t = InfiniteOpt.@infinite_parameter(m, t ~ Truncated(Exponential(1/r),0.0, hi))
-    t = InfiniteOpt.@infinite_parameter(m, t ~ Exponential(1/r))
+    t = InfiniteOpt.@infinite_parameter(m, t ∈ [0, hi])
     z = InfiniteOpt.@variable(m, z[i = 1:dz], InfiniteOpt.Infinite(t))
     c = InfiniteOpt.@variable(m, c[i = 1:dc], InfiniteOpt.Infinite(t))
     for i ∈ 1:dz
@@ -78,7 +81,7 @@ function convert(::Type{InfiniteOpt.InfiniteModel}, oc::OCProblem)
     end
 
     
-    obj = InfiniteOpt.@objective(m, Max, InfiniteOpt.@expect(F(z,c)/r,t))
+    obj = InfiniteOpt.@objective(m, Max, InfiniteOpt.@integral(F(z,c)*exp(-r*t),t))
     
     con = InfiniteOpt.@constraint(m,[InfiniteOpt.deriv(z[i],t) for i in 1:dz] .== G(z,c))
 
@@ -126,14 +129,19 @@ function solve_InfiniteOpt(p::OCProblem; optimizer=Ipopt.Optimizer, nsupport=not
 end
 
 
-import DiffEqFlux, FastGaussQuadrature, Lux, Zygote, SciMLSensitivity, Random
-import DifferentialEquations: ODEFunction, ODEProblem # change to scimlbase?
-import DifferentialEquations
+import FastGaussQuadrature, Lux, Zygote, SciMLSensitivity, Random
+import CommonSolve
+import SciMLBase: ODEFunction, ODEProblem 
+import OrdinaryDiffEq: Tsit5
+
+
+evalm(t,z::AbstractArray,m,θ,st) = first(m(z, θ, st))
+evalm(t,z,m,θ,st) = first(m([z], θ, st))
 
 function createode(p::OCProblem, θ, m, st;  tmax=5/p.r)
     _, re  = Lux.destructure(θ)
     function f!(dz, z, θ::AbstractArray, t)
-        c = first(m([t], re(θ), st))
+        c = evalm(t,z,m, re(θ),st)
         dz .= p.G(z,c)        
     end
     ode_f = ODEFunction(f!)
@@ -142,11 +150,11 @@ function createode(p::OCProblem, θ, m, st;  tmax=5/p.r)
     return(odeprob)
 end
 
-function controlmodel(p::OCProblem; width=32)
-    L = p.L
-    U = p.U
-    out = Vector{Function}(undef, p.dimc)
-    for i ∈ 1:p.dimc
+function constraindomain(L,U, T=eltype(L))
+    out = Vector{Function}(undef, length(L))
+    L = T.(L)
+    U = T.(U)
+    for i ∈ 1:length(L)
         if isfinite(L[i]) && isfinite(U[i]) 
             out[i] = x->(L[i] + (U[i]-L[i])/(1+exp(-x)))
         elseif isfinite(L[i])
@@ -157,21 +165,23 @@ function controlmodel(p::OCProblem; width=32)
             out[i] = x->x
         end
     end    
-    constraindomain = c->[f(x) for (f,x) ∈ zip(out,c)]
+    return(c->[f(x) for (f,x) ∈ zip(out,c)])
+end
 
-    
+function controlmodel(p::OCProblem; width=32)
+    @views cons = constraindomain(p.L[1:p.dimc], p.U[1:p.dimc])
     m = Lux.Chain( 
-            Lux.Dense(1, width, DiffEqFlux.relu),
+            Lux.Dense(1, width, Lux.relu),
             Lux.Dense(width, p.dimc) ,
-            constraindomain)        
+            cons)        
     return(m)
 end
 
 function solveode(odeprob; nint=100, r=0.05)
     t , ert = FastGaussQuadrature.gausslaguerre(nint)
-    ert .*= r
-    t .*= r    
-    sol=DiffEqFlux.solve(odeprob, saveat=t)
+    ert ./= r
+    t ./= r    
+    sol=CommonSolve.solve(odeprob, Tsit5(), saveat=t)
     return(sol)
 end
 
@@ -181,18 +191,18 @@ relaxedlogbarrier(z,δ) = (z<δ) ? (exp(1-z/δ) - 1 - log(δ)) : -log(z)
 function traincontrol(θ, st, m, ocp; nint=100, iterations=100, δ=0.1,μ=1.0,
         opt= Lux.Optimisers.setup(Lux.Optimisers.ADAM(0.1f0), θ))    
     t , ert = FastGaussQuadrature.gausslaguerre(nint)
-    ert .*= ocp.r
-    t .*= ocp.r 
+    ert ./= ocp.r
+    t ./= ocp.r 
     ode = createode(ocp,θ, m, st)
     il = [i for i ∈ 1:ocp.dimz if isfinite(ocp.L[ocp.dimc+i])]
     iu = [i for i ∈ 1:ocp.dimz if isfinite(ocp.U[ocp.dimc+i])]
     penalty(z) = μ*(sum(relaxedlogbarrier.(z[i] - ocp.L[ocp.dimc+i], δ) for i ∈ il) + 
         sum(relaxedlogbarrier.(-z[i] + ocp.U[ocp.dimc+i], δ) for i ∈ iu)) 
     function loss(m, θ, st) 
-        sol = DiffEqFlux.solve(ode(Lux.destructure(θ)[1]),saveat=t
+        sol = CommonSolve.solve(ode(Lux.destructure(θ)[1]),Tsit5(), saveat=t, maxiters=1e3
             #,sensealg=SciMLSensitivity.QuadratureAdjoint()
             )[1,:]
-        l = sum(-ocp.F(s, first(m([τ], θ, st)))*w + penalty(s) for (τ, w, s) ∈ zip(t,ert,sol))
+        l = sum(-ocp.F(z, evalm(τ, z, m, θ, st))*w + penalty(z) for (τ, w, z) ∈ zip(t,ert,sol))
         return(l)
     end
       
@@ -210,5 +220,124 @@ function traincontrol(θ, st, m, ocp; nint=100, iterations=100, δ=0.1,μ=1.0,
     return(θ, m, st, opt)
 end
 
+
+
+function hamiltonianode(ocp)
+    dz = ocp.dimz
+    function f!(du, u, θ::AbstractArray, t)
+        c = evalm(t,z,m, re(θ),st)
+        du[1:dz] .= p.G(u[1:dz],c)        
+        λ = @view u[(dz+1):end]
+        dλ = @view du[(dz+1):end] 
+        dλ = -p.F
+        
+    end
+    ode_f = ODEFunction(f!)
+    odeprob(a::AbstractArray) = ODEProblem(ode_f, p.z0, (0,tmax), a)    
+    odeprob(tp::NamedTuple) = ODEProblem(ode_f, p.z0, (0,tmax), Lux.destructure(tp)[1])        
+    return(odeprob)
+end
+
+import FiniteDiff
+
+"""
+
+Method of Mortezaee & Nazemi (2019)
+"""
+function neuralcollocation(p, width; points=100, opt = nothing)
+    RType = Float32
+    t , ert = FastGaussQuadrature.gausslaguerre(points)
+    ert ./= p.r
+    t ./= p.r
+
+    invmaxt = 1/maximum(t)
+    scalet = t->t*invmaxt*2
+    cm = Lux.Chain( scalet,
+             Lux.Dense(1, width, Lux.relu),
+            Lux.Dense(width, p.dimc) ,
+        constraindomain(p.L[1:p.dimc], p.U[1:p.dimc], RType))        
+    zm = Lux.Chain( scalet,
+        Lux.Dense(1, width, Lux.relu),
+        Lux.Dense(width, p.dimz) ,
+        constraindomain(p.L[p.dimc+1:end].-p.z0, p.U[p.dimc+1:end].-p.z0, RType))        
+    λm = Lux.Chain( scalet,
+            Lux.Dense(1, width, Lux.relu),
+            Lux.Dense(width, p.dimz))                    
+
+    rng = Random.default_rng()
+    θc, stc = Lux.setup(rng,cm)
+    θc.layer_2.bias .= Random.rand(scalet.(t), width)
+    θc.layer_3.weight .*= 0.1
+    θc.layer_3.bias .= -log((p.U[1]-p.L[1])/(1.0+p.r*p.z0[1]-p.L[1])-1) 
+    θz, stz = Lux.setup(rng,zm)
+    θz.layer_2.bias .= Random.rand(scalet.(t), width)
+    θz.layer_3.bias .= -log((p.U[2]-p.L[2])/(p.z0[1]-p.L[2])-1) 
+    θλ, stλ = Lux.setup(rng,λm)
+    θλ.layer_2.bias .= Random.rand(scalet.(t), width)
+
+    H = hamiltonian(p)
+    focs(t, z, c, λ, ż, λ̇) = [ 
+        ż .- p.G(z,c),
+        FiniteDiff.finite_difference_gradient(c->H(t,z,c,λ),c,Val(:central), eltype(c), Val(false)),
+        #ForwardDiff.gradient(c->H(t,z,c,λ),c),
+        λ̇ + FiniteDiff.finite_difference_gradient(z->H(t,z,c,λ),z,Val(:central), eltype(z), Val(false))
+           # ForwardDiff.gradient(z->H(t,z,c,λ),z)
+        ]
+    RType = eltype(θc.layer_2.bias)
+    t = RType.(t)
+    function loss(θc, θz, θλ)
+        C(t) = cm([t], θc, stc)[1]
+        Z(t) = RType.(p.z0) .+ tanh(t)*zm([t], θz, stz)[1]
+        Ż(t) = FiniteDiff.finite_difference_derivative(Z,t)
+        Λ(t) = exp(-RType(p.r)*t)*λm([t], θλ, stλ)[1]
+        Λ̇(t) = FiniteDiff.finite_difference_derivative(Λ,t)
+        sum( sum(x->x'*x, 
+            focs(s, Z(s), C(s), Λ(s), Ż(s), Λ̇(s)))
+         for s ∈ t
+        )
+    end
+    
+    
+    ℓ = p -> loss(p...)
+    θ = (θc,θz,θλ)
+    lval, back = Zygote.pullback(ℓ,θ)
+    gs = back(one(lval))[1]
+    @show gs
+    x, re = Lux.destructure(θ)
+    gf = ForwardDiff.gradient(x->ℓ(re(x)),x)
+    
+    for (z, f) ∈ zip(gs, re(gf))        
+        for k ∈ keys(z)
+            if !(k ∈ keys(f))
+                @warn "$k not found in forward gradient"
+                continue
+            end
+            try
+                @show k
+                @show norm(z[k][:bias]-f[k][:bias])
+                @show norm(z[k][:weight]-f[k][:weight])
+            catch
+                println("$k doesn't have bias and/or weight")
+            end
+        end
+    end
+
+    if isnothing(opt)
+        opt = Lux.Optimisers.setup(Lux.Optimisers.ADAM(0.1f0), θ)
+    end 
+    for i ∈ 1:iterations
+        lval, back = Zygote.pullback(ℓ, θ)
+        gs = back(one(lval))[1]
+        opt, θ = Lux.Optimisers.update(opt, θ, gs)
+        println("Iter[$i]: obj=$(lval)")
+    end
+    θc, θz, θλ = θ
+    C(t) = cm([t], θc, stc)[1]
+    Z(t) = p.z0 + tanh(t)*zm([t], θz, stz)[1]
+    Ż(t) = ForwardDiff.derivative(Z,t)
+    Λ(t) = exp(p.r*t)*λm([t], θλ, stλ)[1]
+    Λ̇(t) = ForwardDiff.derivative(Λ,t)
+    return(C=C, Z=Z, Ż = Ż, Λ=Λ, Λ̇=Λ̇, θ=θ, opt=opt)    
+end
 
 end
