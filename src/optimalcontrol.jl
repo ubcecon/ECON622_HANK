@@ -249,14 +249,14 @@ function neuralcollocation(p, width; points=100, opt = nothing)
 
     rng = Random.default_rng()
     θc, stc = Lux.setup(rng,cm)
-    θc.layer_2.bias .= Random.rand(scalet.(t), width)
+    θc.layer_2.bias .= Random.rand(-scalet.(t), width)
     θc.layer_3.weight .*= 0.1
     θc.layer_3.bias .= -log((p.U[1]-p.L[1])/(1.0+p.r*p.z0[1]-p.L[1])-1) 
     θz, stz = Lux.setup(rng,zm)
-    θz.layer_2.bias .= Random.rand(scalet.(t), width)
+    θz.layer_2.bias .= Random.rand(-scalet.(t), width)
     θz.layer_3.bias .= -log((p.U[2]-p.L[2])/(p.z0[1]-p.L[2])-1) 
     θλ, stλ = Lux.setup(rng,λm)
-    θλ.layer_2.bias .= Random.rand(scalet.(t), width)
+    θλ.layer_2.bias .= Random.rand(-scalet.(t), width)
 
     H = hamiltonian(p)
     focs(t, z, c, λ, ż, λ̇) = [ 
