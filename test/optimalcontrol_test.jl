@@ -27,7 +27,9 @@
     θz[end] = -log((p.U[1]-p.L[1])/(y+p.r*p.z0[1]-p.L[1])-1)
     s = OC.solveode(ode(θz))
     plt = Plot()
-    t = range(0.01, 90.0, 1000)
+    t , ert = FastGaussQuadrature.gausslaguerre(points)
+    ert ./= p.r
+    t ./= p.r
     plt(x=t,y=vcat((t->m([t], re(θz), st)[1][1]).(t)...), name="consumption", mode="lines+markers")
     plt(x=t,y=vcat(s.(t)...), name="savings", mode="lines+markers")    
     plt
