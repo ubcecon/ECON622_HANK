@@ -1,0 +1,641 @@
+---
+title: "Solving Economics Related PDEs"
+author: "Paul Schrimpf"
+format:
+  html:
+    code-fold: true
+    code-echo: true
+jupyter: julia
+---
+
+# Partial Differential Equation Packages
+
+- [EconPDEs.jl](https://github.com/matthieugomez/EconPDEs.jl) solves via discretization. Similar to the method described in @achdou2021. Limited to 2 state variables. [Extending to more would be a welcome addition.](https://github.com/matthieugomez/EconPDEs.jl/issues/31)
+
+- [ApproxFun.jl](https://github.com/JuliaApproximation/ApproxFun.jl) see [the docs](https://juliaapproximation.github.io/ApproxFun.jl/latest/generated/PDE/)
+
+- [Gridap.jl](https://github.com/gridap/Gridap.jl)
+
+## SciML
+
+- [NeuralPDE.jl](https://github.com/SciML/NeuralPDE.jl) solves via collocation using neural networks to approximate functions.
+
+- [HighDimPDE.jl](https://github.com/SciML/HighDimPDE.jl)
+
+- [MethodOfLines.jl](https://github.com/SciML/MethodOfLines.jl) solves via discretization
+
+
+# Aiyigari-Bewley-Huggett
+
+As an example, we will follow @achdou2021 and solve a continuous time Hugget model. Their [online appendix](https://benjaminmoll.com/wp-content/uploads/2020/02/HACT_Numerical_Appendix.pdf) is also a good reference.
+
+
+We start by solving just the consumer's problem.
+$$
+\begin{align*}
+\max_{c,a} & \Er[ \int_0^\infty e^{-\rho t} u(c) dt ] \\
+& \text{s. t.} \\
+& \dot{a} = y_t + r a - c \\
+& a \geq a_L
+\end{align*}
+$$
+where $y_t \in \{y_1, y_2\}$ and follows a Poisson jump process, transitioning away from $y_j$ at rate $\lambda_j$
+
+The HJB equations for this model are
+$$
+\rho v_j(t,a) = u(c_j(t,a)) + \frac{\partial v_j(t,a)}{\partial a}(y[j] + ra - c_j(t,a)) + \lambda[1]*(v_o(t,a) - v_j(t,a)) + \frac{\partial v_j(t,a)}{\partial t}
+$$
+with $u'(c_j(t,a)) = \frac{\partial v_j(t,a)}{\partial a}$, and $o \in \{1,2\}$ and $o \neq j$.
+
+The constraint $a \geq a_L$ is equivalent to
+$$
+c_j(t,a_L) \leq y[j] + ra_L
+$$
+which is also equivalent to
+$$
+\frac{\partial v_j(t,a)}{\partial a} \geq u'(y[j] + r a_L)
+$$
+Also, for some solution methods, we will use the fact that if $y[1] < y[2]$, then the above binds for $j=1$, but not $2$. If we didn't know this, we could try various combinations of binding constraints to find the solution.
+
+```{julia}
+using PlotlyLight, LinearAlgebra, ModelingToolkit
+import NeuralPDE, Lux, Zygote, ForwardDiff
+import Optimization, OptimizationOptimJL, OptimizationOptimisers, NLsolve
+import ModelingToolkit: Interval, infimum, supremum,@parameters, @variables, Differential, @named
+```
+
+## Model parameters
+```{julia}
+r = 0.05
+ρ = 0.05
+y = [0.1, 3.0]
+aL = y[1]
+λ = [0.1, 0.2]
+u, du = let cmin = (y[1] + r*aL)/2;
+    # u=log, but with care to avoid log(negative) and division by 0
+    u(c) = ModelingToolkit.IfElse.ifelse(c>cmin, log(abs(c)+eps()), log(cmin) + 1/cmin*(c-cmin) - 0.5/cmin^2*(c-cmin)^2)
+    du(c)= ModelingToolkit.IfElse.ifelse(c>cmin, 1/(c+eps()/2), 1/cmin - 1/cmin^2*(c-cmin))
+    (u,du)
+end
+invdu = du
+amax = 100
+Ey = r*([r+λ[1] -λ[1]; -λ[2] r+λ[2]] \ y)
+```
+
+# Steady-State
+
+First, we will solve for the steady-state value and policy functions. The steady state will be useful when solving the dynamics of the model.
+
+## EconPDEs.jl
+
+```{julia}
+import EconPDEs
+import OrderedCollections: OrderedDict
+
+function ssf(state, sol)
+  a = state.a
+  v1, v1a_up, v1a_down,v1aa,v2, v2a_up, v2a_down,v2aa = sol
+  dv1 = v1a_up
+  c1 = invdu(dv1)
+  if (y[1] + r*a - c1 < 0)
+    dv1 = v1a_down
+    c1 = invdu(dv1)
+  end
+  dv2 = v2a_up
+  c2 = invdu(dv2)
+  if (y[2] + r*a - c2<0)
+    dv2 = v2a_down
+    c2 = invdu(dv2)
+  end
+  if  (a ≈ aL)
+    if (y[1] + r*aL - c1 < 0)
+      c1 = y[1] + r*aL
+      dv1 = invdu(c1)
+    end
+    if (y[2] + r*aL - c2 < 0)
+      c2 = y[2] + r*aL
+      dv2 = invdu(c2)
+    end
+  end
+  if  (a ≈ amax)
+    c1 = Ey[1] + r*amax
+    dv1 = invdu(c1)
+    c2 = Ey[2] + r*amax
+    dv2 = invdu(c2)
+  end
+  dvt1 = ρ*v1 - (u(c1) + dv1*(y[1] + r*a - c1) + λ[1]*(v2 - v1))
+  dvt2 = ρ*v2 - (u(c2) + dv2*(y[2] + r*a - c2) + λ[2]*(v1 - v2))
+  return((v1t=dvt1,v2t=dvt2))
+end
+stategrid = OrderedDict(:a => (range(0,1,length=500).^2*(amax-aL) .+ aL))
+yend = OrderedDict(:v1 => [u.(Ey[1] + r*a)/ρ  for a ∈ stategrid[:a]],
+                   :v2=>[u.(Ey[2] + r*a)/ρ  for a ∈ stategrid[:a]])
+res = EconPDEs.pdesolve(ssf,stategrid,yend, iterations=1000)
+```
+### Checking the solution
+
+We should check this solution for correctness. One simple check is that the value should be at least the value from just consuming $y[j] + ra$. This is a feasible strategy, so the optimal one should give higher value.
+Also, an easily calculated upper bound to the value function is the value function in a model without a borrowing constraint. In that case, optimal consumption is $E[y|j] + ra$, where $E[y|j]$ is r times the expected present discounted value of income given current state.
+
+This figure is to visually check whether these bounds hold.
+
+```{julia}
+plt = Plot();
+plt.layout = Config(title="Value Functions")
+Eu = (a,j)->([ρ+λ[1] -λ[1]; -λ[2] ρ+λ[2]] \ u.(y .+ r*a))[j];
+ap = stategrid[:a];
+plt(x=ap, y=res.zero[:v1], name="v1");
+plt(x=ap, y=res.zero[:v2], name="v2");
+plt(x=ap, y=Eu.(ap,1), name="naive v1", mode="markers");
+plt(x=ap, y=u.(Ey[1] .+ r*ap)./ρ, name="insured v1", mode="markers");
+plt(x=ap, y=Eu.(ap,2), name="naive v2", mode="markers");
+plt(x=ap, y=u.(Ey[2] .+ r*ap)./ρ, name="insured v2", mode="markers")
+```
+
+If this code was going into a package, we would want to formalize this check by creating a test.
+
+```{julia}
+using Test
+@testset "EconPDEs solution" begin
+  tol = sqrt(eps())
+  @test all( res.zero[:v1] .≥ Eu.(ap,1)*(1 - tol) )
+  @test all( res.zero[:v1] .≤ u.(Ey[1] .+ r*ap)./ρ*(1 + tol) )
+  @test all( res.zero[:v2] .≥ Eu.(ap,2)*(1 - tol) )
+  @test all( res.zero[:v2] .≤ u.(Ey[2] .+ r*ap)./ρ*(1 + tol) )
+end;
+```
+
+Similar bounds do not apply to the consumption function, but it can still be useful to plot.
+
+```{julia}
+c1  = invdu.(diff(res.zero[:v1])./diff(ap))
+c2  = invdu.(diff(res.zero[:v2])./diff(ap))
+for i in (length(c2)-1):-1:1
+  if (c2[i] > c2[i+1])
+    c2[i] = c2[i+1]
+  end
+end
+
+plt = Plot();
+plt.layout=Config(title="Consumption")
+plt(x=ap[1:(end-1)],y=c1, name="c1");
+plt(x=ap[1:(end-1)],y=c2, name="c2");
+plt(x=ap, y=y[1] .+ r*ap, name="naive c1", mode="markers");
+plt(x=ap,y=Ey[1] .+ r*ap, name="insured c1", mode="markers");
+plt(x=ap, y=y[2] .+ r*ap, name="naive c2", mode="markers");
+plt(x=ap,y=Ey[2] .+ r*ap, name="insured c2", mode="markers")
+```
+
+Of course, an incorrect solution could satisfy these bounds, so we should make additional checks.
+
+We can simulate paths of consumption and assets using the solved for consumption function. We can check if the simulated values are close to the solved for value function.
+
+The differential equations package makes it reasonably easy to compute these simulations.
+```{julia}
+import JumpProcesses, OrdinaryDiffEq
+import Statistics: mean, var
+consume = let ap=ap, c1  = invdu.(diff(res.zero[:v1])./diff(ap)), c2  = invdu.(diff(res.zero[:v2])./diff(ap));
+  trunc = 3
+  agrid = ap[1:end-1].+diff(ap)
+  agrid = agrid[1:(end-trunc)]
+  c1 = c1[1:(end-trunc)]
+  c2 = c2[1:(end-trunc)]
+  lc = [Interpolations.linear_interpolation(agrid, c1, extrapolation_bc = Interpolations.Line()),
+        Interpolations.linear_interpolation(agrid, c2, extrapolation_bc = Interpolations.Line())]
+  function c(a,j)
+    c = lc[j](a)
+    if (a ≈ aL)
+      c = min(y[j] + r*aL, c)
+    end
+    c
+  end
+end
+
+csym(a,j) = consume(a,1 + (j>1.5))
+@register_symbolic csym(a,j)
+ysym(j) = y[1]*(j<1.5) + y[2]*(j>1.5)
+@register_symbolic ysym(j)
+@parameters t #cs(..) ys(..)
+@variables v(t) a(t) j(t)
+Dt = Differential(t)
+eq = [Dt(v) ~ exp(-ρ*t)*u(csym(a,j)),
+      Dt(a) ~ ysym(j) + r*a - csym(a,j)]
+rate(u,c,t) = λ[1+(u[3]>1.5)]
+function affect!(integrator)
+  j = integrator.u[3]
+  integrator.u[3] = 1*(j>=1.5) + 2*(j<1.5)
+end
+jump = JumpProcesses.VariableRateJump(rate,affect!)
+@named os=ODESystem(eq,t,[v,a,j],[],tspan=(0,100.0))
+op = ODEProblem(os, [v => 0.0, a=>10.0, j=>2], (0,100.0), [], check_length=false)
+jprob = JumpProblem(op, JumpProcesses.Direct(), jump)
+sol = OrdinaryDiffEq.solve(jprob, OrdinaryDiffEq.Tsit5())
+```
+On average, the final value of `v` in this solution should equal the value function of the inital `a` and `j`. Let's now run this simulation many times and check the average `v`.
+
+```{julia}
+S = 100
+icheck = Int.(round.(range(1,length(ap),length=50)))
+v = zeros(length(icheck),2)
+vm = zeros(length(icheck),2)
+vs = zeros(length(icheck),2)
+for (j,i) ∈ enumerate(icheck)
+  v[j,:] = [res.zero[:v1][i] res.zero[:v2][i]]
+  prob = OrdinaryDiffEq.remake(op,u0=[0.0, ap[i], 1.])
+  jprob = JumpProblem(prob, JumpProcesses.Direct(), jump)
+  simv = [OrdinaryDiffEq.solve(jprob,OrdinaryDiffEq.Tsit5()).u[end][1] for _ in 1:S]
+  vm[j,1] = mean(simv)
+  vs[j,1] = sqrt(var(simv)/S)
+  prob = OrdinaryDiffEq.remake(op,u0=[0.0, ap[i], 2.])
+  jprob = JumpProblem(prob, JumpProcesses.Direct(), jump)
+  simv = [OrdinaryDiffEq.solve(jprob,OrdinaryDiffEq.Tsit5()).u[end][1] for _ in 1:S]
+  vm[j,2] = mean(simv)
+  vs[j,2] = sqrt(var(simv)/S)
+  println("$j of $(length(icheck))")
+end
+
+plt = Plot();
+plt.layout = Config(title="v1(a)");
+plt(x = ap[icheck], y=v[:,1]);
+plt(x = ap[icheck], y=vm[:,1]);
+plt(x = ap[icheck], y=vm[:,1].+2*vs[:,1],mode="markers");
+plt(x = ap[icheck], y=vm[:,1].-2*vs[:,1],mode="markers")
+```
+
+```{julia}
+plt = Plot();
+plt.layout = Config(title="v2(a)");
+plt(x = ap[icheck], y=v[:,2]);
+plt(x = ap[icheck], y=vm[:,2]);
+plt(x = ap[icheck], y=vm[:,2].+2*vs[:,2],mode="markers");
+plt(x = ap[icheck], y=vm[:,2].-2*vs[:,2],mode="markers")
+```
+
+Those look good.
+
+::: {.callout-tip}
+
+This check helped me discover a couple typos in the `ssf` function that were leading to slightly incorrect solutions.
+
+:::
+
+## Projection and Boosting
+
+Now, we use a projection and boosting approach to approximate the value function.
+
+I'm not certain that this a good a technique. I tried it because we covered boosting recently, and thought this could be an interesting application.
+
+It might be that "boosting" here just collapses down to being Netwon's method on the system of HJB equations. In that case, this is a roundabout way of getting to a standard algorithm.
+
+```{julia}
+nb = 20
+acti = x->Lux.relu(x)
+function agen(aL,amax;length=10,pow=2)
+    u=range(0,1,length=length)
+    return(u.^pow*(amax-aL) .+ aL)
+end
+dacti = x->ForwardDiff.derivative(acti,x)
+basis = vcat(x->1.0, [x->acti.(x.- a) for a in agen(aL*(1-2*eps()),amax, length=nb)[1:(end-1)]])
+dbasis = vcat(x->0.0,[x->dacti.(x .- a) for a in agen(aL*(1-2*eps()),amax,length=nb)[1:(end-1)]])
+agrid = agen(aL, amax, length=1000)
+A = hcat((b.(agrid) for b in basis)...)
+dA = hcat((b.(agrid) for b in dbasis)...)
+vparam = ones(nb,2)
+v0 = reshape([u(y[i] + r*a)/ρ for i in 1:2 for a in agrid],length(agrid),2)
+vparam = A'*A \ A'*v0
+V(a,x) = sum(b(a)*p for (b,p) in zip(basis, eachrow(x)))
+C(a,x) = invdu.(sum(b(a)*p for (b,p) in zip(dbasis, eachrow(x))))
+```
+
+```{julia}
+boost = let basis=basis, A=A, dA=dA, cAA=qr(A'*A), c=similar(v0), vnew=similar(v0), vold=similar(v0), vgrad=similar(v0);
+    function(vparam, stepsize=1.0; verbose=false)
+        vold .= A*vparam
+        c .= invdu.(dA*vparam)
+      if (y[1] + r*aL - c[1,1]) < 0
+        c[1,1] = y[1] + r*aL
+      end
+      if (y[2] + r*aL - c[1,2]) < 0
+        c[1,2] = y[2] + r*aL
+      end
+        for j in 1:2
+            o = (j % 2) + 1
+            vnew[:,j] .= (-ρ*vold[:,j] + (u.(c[:,j]) + (dA*vparam[:,j]).*(y[j] .+ r*agrid .- c[:,j]) +
+                          λ[j]*(vold[:,o] - vold[:,j])))
+        end
+        for j in 1:2
+            o = (j % 2) + 1
+            vgrad[:,j] .= vnew[:,j].*(-ρ - λ[j] - r) + vnew[:,o].*λ[o]
+        end
+      if verbose
+        println("||grad|| = $(norm(vgrad))")
+      end
+        vout = copy(vparam)
+        vout = vparam - stepsize*(cAA \ A'*vgrad)
+        vout
+    end
+end
+x = copy(vparam)
+#x = zeros(size(vparam))
+plt = Plot();
+ss = 0.1
+ndx = Inf
+naccept = 0
+
+for i in 1:1000
+  verbose=false
+    if ((i-1)%10)==0
+        v = map(a->V(a,x)[1],agrid)
+        v[isnan.(v)] .= 0
+      plt(x=agrid, y=v)
+      verbose=true
+    end
+    xnew = boost(x, ss,verbose=verbose)
+    nndx = norm(A*(xnew-x))
+    if nndx > ndx
+        @show ss *= 0.5
+        xnew .= x
+    else
+        naccept += 1
+        ndx = nndx
+        x .= xnew
+    end
+    if (naccept > 10)
+        ss *= 2
+        naccept=0
+    end
+    println("$i: ||dx||=$nndx")
+    if (nndx<1e-8)
+        break
+    end
+end
+v1fig=plt();
+plt = Plot();
+vbfig = plt(x=agrid, y = map(a->V(a,x)[1],agrid),name="v1");
+vbfig = plt(x=agrid, y = map(a->V(a,x)[2],agrid),name="v2");
+vbfig=let A = stategrid[:a];
+  plt(x=A, y=res.zero[:v1], name="v1");
+  plt(x=A, y=res.zero[:v2], name="v2");
+end
+
+plt = Plot();
+cfig = plt(x=agrid, y=map(a->C(a,x)[1],agrid),type="scatter", mode="markers");
+cfig = plt(x=agrid, y=map(a->C(a,x)[2],agrid),type="scatter", mode="markers");
+cfig = let A = stategrid[:a];
+  plt(x=A[1:(end-1)],y=c1, name="c1");
+  plt(x=A[1:(end-1)],y=c2, name="c2");
+end
+```
+
+##
+
+# Dynamics
+
+```{julia}
+# Define the differential equations using ModelingToolkit
+@parameters a
+@variables v1(..) v2(..) c1(..) c2(..)
+Da = Differential(a)
+# steady-state (equation 12 in the paper)
+eqss = [#ρ*v1(a) ~ u(T(c1(a))) + Da(v1(a))*(y[1] + r*a - T(c1(a))) + λ[1]*(v2(a) - v1(a)),
+        #ρ*v2(a) ~ u(T(c2(a))) + Da(v2(a))*(y[2] + r*a - T(c2(a))) + λ[2]*(v1(a) - v2(a)),
+        ρ*v1(a) ~ u(invdu(Da(v1(a)))) + Da(v1(a))*(y[1] + r*a) - 1 + λ[1]*(v2(a) - v1(a)),
+        ρ*v2(a) ~ u(invdu(Da(v2(a)))) + Da(v2(a))*(y[2] + r*a) - 1 + λ[2]*(v1(a) - v2(a))]
+        # First order condition for consumption
+        #du(T(c1(a))) ~  Da(v1(a)),
+        #du(T(c2(a))) ~ Da(v2(a))]
+Ey = r*([r+λ[1] -λ[1]; -λ[2] r+λ[2]] \ y)
+boundarycondition_ss = [
+    # Are these correct? Not sure , but they do imply a in [aL,amax]
+    Da(v1(aL)) ~ du(y[1] + r*aL),
+    Da(v2(amax)) ~ du(y[2] + r*amax),
+    #c1(aL) ~ log(y[1] + r*aL),
+    #c1(amax) ~ Ey[1] + r*amax,
+    #c2(amax) ~ Ey[2] + r*amax,
+    v1(amax) ~ u(Ey[1] + r*amax)/ρ,
+    v2(amax) ~ u(Ey[2] + r*amax)/ρ
+    ]
+domain_ss = [a ∈ Interval(aL, amax)]
+
+@named pde_ss = ModelingToolkit.PDESystem(eqss, boundarycondition_ss, domain_ss, [a], [v1(a), v2(a)] )#, c1(a), c2(a)])
+```
+```{julia}
+import MethodOfLines
+import MethodOfLines: center_align, MOLFiniteDifference
+import NonlinearSolve, SciMLNLSolve
+N = 30
+mdisc = MOLFiniteDifference([a=>(amax-aL)/N], nothing, approx_order=2, grid_align=center_align)
+dprob = MethodOfLines.discretize(pde_ss, mdisc)
+agrid = range(aL,amax, length=(N+1))
+function u0maker(syms)
+    u0 = zeros(length(syms))
+    for (i, s) in enumerate(syms)
+        m = match(r"v(\d), (\d)",String(s))
+        ja = parse.(Int,m.captures)
+        u0[i] = u(y[ja[1]] + r*agrid[ja[2]])/r
+    end
+    return(u0)
+end
+dprob.u0 .= u0maker(dprob.f.syms)
+solver = NonlinearSolve.NewtonRaphson()
+solver = SciMLNLSolve.NLSolveJL(method=:anderson,m=0)
+solver = SciMLNLSolve.NLSolveJL(method=:trust_region)
+sol = MethodOfLines.solve(dprob,solver )
+dprob.u0 .= sol.u
+sol = MethodOfLines.solve(dprob,NonlinearSolve.NewtonRaphson())
+
+```
+```{julia}
+plt = Plot()
+plt(x=sol[a],y=sol[v1(a)],name="v1")
+plt(x=sol[a],y=sol[v2(a)],name="v2")
+```
+```{julia}
+plt = Plot()
+plt(x=sol[a],y=T.(sol[c1(a)]),name="c1")
+plt(x=sol[a],y=T.(sol[c2(a)]),name="c2")
+```
+
+```{julia}
+# Models to fit to v1,v2,c1,c2
+W = 32
+D = 1
+acti = Lux.sigmoid_fast
+# feedforward networks for v
+vmodel = [Lux.Chain(Lux.Dense(1,W,acti), [Lux.Dense(W,W,acti) for _ in 1:D]..., Lux.Dense(W,1)) for i in 1:2]
+
+# For c, we need to at least constrain c>0, can also try imposing c(aL) <= r*aL+y and
+# c(amax) >= r*amax + y
+function constrainer(x, a, y; aL=aL, amax=amax, s=1)
+    wL = 1 .- Lux.softsign.(s*(a .- aL))
+    wH = 1 .- Lux.softsign.(s*(amax.-a))
+    sx = Lux.sigmoid_fast.(x)
+    px = Lux.softplus.(x)
+    return(sx.*wL.*(y .+ r*aL) .+ px.*(1 .-wL) .+ wH.*(y .+ r*amax))
+end
+plt = Plot()
+a = vcat(range(aL,aL+1, length=100),
+         range(aL+1,amax-1,length=100),
+         range(amax-1,amax,length=100))
+for x in range(-10,10, length=11)
+    plt(x=a, y=constrainer.(x,a,y[1]), name="$x")
+end
+plt()
+#cmodel = [Lux.SkipConnection(deepcopy(vmodel[i]), (x,a)->constrainer(x,a,y[i])) for i in 1:2]
+
+#vmodel = [Lux.Chain(Lux.Dense(1,W,acti), [Lux.Dense(W,W,acti) for _ in 1:D]..., Lux.Dense(W,1)) for i in 1:2]
+cmodel = [Lux.Chain(Lux.Dense(1,W,acti), [Lux.Dense(W,W,acti) for _ in 1:D]..., Lux.Dense(W,1,Lux.softplus)) for i in 1:2]
+model = [vmodel..., cmodel...]
+```
+# Stale code
+```{julia}
+# Initially make consumption and v near the solution without borrowing constraints
+u0 = copy(prob.u0)
+function loss(p, a=range(aL,amax, length=30))
+    sum( (discretization.phi[1](x,p.depvar[:v1])[1] - u.(Ey[1].+r*x)/ρ)^2 +
+       (discretization.phi[2](x,p.depvar[:v2])[1] - u.(Ey[2].+r*x)/ρ)^2 +
+       (discretization.phi[3](x,p.depvar[:c1])[1] - (Ey[1].+r*x))^2 +
+       (discretization.phi[4](x,p.depvar[:c2])[1] - (Ey[2].+r*x))^2
+       for x in a)
+end
+loss(u0)
+
+x0, re = Lux.destructure(u0)
+Lx = x -> loss(re(x), a = rand(30)*(amax-aL).+aL)
+lval, back = Zygote.pullback(Lx,x0)
+@time gs = back(one(lval))[1];
+
+x = copy(x0)
+opt = Lux.Optimisers.setup(Lux.Optimisers.ADAM(0.1f0), x)
+iterations = 1000
+for i ∈ 1:iterations
+    lval, back = Zygote.pullback(Lx, x)
+    gs = back(one(lval))[1]
+    opt, x = Lux.Optimisers.update(opt, x, gs)
+    (i % 100)==0 && println("Iter[$i]: obj=$(lval)")
+end
+```
+
+# NeuralPDE
+
+```{julia}
+@parameters a t
+@variables v1(..) v2(..) c1(..) c2(..)
+Da = Differential(a)
+Dt = Differential(t)
+U(c) = log(c)
+dU(c) = 1/c
+Tmax = 100.0
+eqss = [ρ*v1(t,a) ~ U(c1(t,a)) + Da(v1(t,a))*(y[1] + r*a - c1(t,a)) + λ[1]*(v2(t,a) - v1(t,a)) + Dt(v1(t,a)),
+        ρ*v2(t,a) ~ U(c2(t,a)) + Da(v2(t,a))*(y[2] + r*a - c2(t,a)) + λ[2]*(v1(t,a) - v2(t,a)) + Dt(v2(t,a)),
+        # First order condition for consumption
+        dU(c1(t,a)) ~ Da(v1(t,a)),
+        dU(c2(t,a)) ~ Da(v2(t,a)) ]
+Ey = r*([r+λ[1] -λ[1]; -λ[2] r+λ[2]] \ y)
+boundarycondition_ss = [
+    Da(v1(t,aL)) ~ dU(y[1] + r*aL),
+    #Da(v2(amax)) ~ du(y[2] + r*amax),
+    c1(t,aL) ~ y[1] + r*aL,
+    #c1(amax) ~ Ey[1] + r*amax,
+    #c2(amax) ~ Ey[2] + r*amax,
+    #v1(amax) ~ u(Ey[1] + r*amax)/ρ,
+    #v2(amax) ~ u(Ey[2] + r*amax)/ρ
+    ]
+domain_ss = [a ∈ Interval(aL, amax), t ∈ Interval(0, Tmax) ]
+
+
+@named pde_ss = ModelingToolkit.PDESystem(eqss, boundarycondition_ss, domain_ss, [t, a], [v1(t,a), v2(t,a), c1(t,a), c2(t,a)])
+```
+
+Setup the optimization problem and optimize.
+```{julia}
+W = 128
+acti = Lux.relu
+D = 1
+#rescale(x) = (x)->(x./[Tmax,amax] .- 0.5).*2
+vmodel = [Lux.Chain(Lux.Dense(2,W,acti), [Lux.Dense(W,W,acti) for _ in 1:D]..., Lux.Dense(W,1)) for i in 1:2]
+cmodel = [Lux.Chain(Lux.Dense(2,W,acti), [Lux.Dense(W,W,acti) for _ in 1:D]..., Lux.Dense(W,1,Lux.softplus)) for i in 1:2]
+model = [vmodel..., cmodel...]
+discretization = NeuralPDE.PhysicsInformedNN(model, NeuralPDE.QuasiRandomTraining(100)) #, adaptive_loss=NeuralPDE.MiniMaxAdaptiveLoss(50))
+prob = NeuralPDE.discretize(pde_ss,discretization)
+sym_prob = NeuralPDE.symbolic_discretize(pde_ss, discretization);
+
+callback = let iters=1;
+    function (p,l)
+        #losses[iters] = l
+        #iters = (iters % length(losses)) + 1
+        iters = iters + 1
+        (iters % 20 == 0) && println("Current loss is: $l")
+        #println("pde_losses: ", map(l_ -> l_(p), sym_prob.loss_functions.pde_loss_functions))
+        #println("bcs_losses: ", map(l_ -> l_(p), sym_prob.loss_functions.bc_loss_functions))
+        return false
+    end
+end
+```
+
+```{julia}
+using PlotlyLight
+function plotvc(params,t;ip=[1,2],lab=["v1","v2"])
+    a = range(infimum(domain_ss[1].domain), supremum(domain_ss[1].domain), length=300)
+    v1 = [discretization.phi[ip[1]]([t,x],params.depvar[Symbol(lab[1])])[1] for x in a]
+    v2 = [discretization.phi[ip[2]]([t,x],params.depvar[Symbol(lab[2])])[1] for x in a]
+
+    plt = Plot()
+    plt(x=a, y=v1, name=lab[1])
+    plt(x=a, y=v2, name=lab[2])
+    if lab[2]=="v2"
+        plt(x=a, y=u.(Ey[2].+r*a*amax)./ρ, name="v2 unconstrained")
+    else
+        plt(x=a, y=Ey[2].+r*a*amax, name="c2 unconstrained")
+    end
+    return(plt())
+end
+plotv(p,t) = plotvc(p,t)
+plotc(p,t) = plotvc(p,t;ip=[3,4],lab=["c1","c2"])
+```
+
+Solve the problem
+```{julia}
+#opt = OptimizationOptimJL.LBFGS()
+u0 = deepcopy(prob.u0)
+opt = OptimizationOptimisers.Adam(0.001)
+#prob.u0 .= re(x)
+#prob.u0 .= res.u
+res = Optimization.solve(prob, opt; callback = callback,maxiters=2000);
+```
+
+Plot the result.
+```{julia}
+plotc(res.u,100)
+```
+```{julia}
+function plotc(params,t)
+    a = range(infimum(domain_ss[1].domain), supremum(domain_ss[1].domain), length=300)
+    c1 = [discretization.phi[3]([t,x],params.depvar[:c1])[1] for x in a]
+    c2 = [discretization.phi[4]([t,x],params.depvar[:c2])[1] for x in a]
+
+    plt = Plot()
+    plt(x=a, y=c1, name="c1")
+    plt(x=a, y=c2, name="c2")
+    plt(x=a, y=(Ey[1].+r*a), name="cc1")
+    plt(x=a, y=(Ey[2].+r*a), name="cc2")
+    return(plt)
+end
+plotv(res.u, 50)
+```
+
+
+```{julia}
+@parameters a
+@variables v1(a) v2(a)
+invdu(x) = 1/x
+Da = Differential(a)
+eq = [ρ*v1 ~ u(invdu(Da(v1))) + Da(v1)*(y[1] + r*a) - 1  + λ[1]*(v2 - v1),
+        ρ*v2 ~ u(invdu(Da(v2))) + Da(v2)*(y[2] + r*a) - 1 + λ[2]*(v1 - v2)]
+@named os=ModelingToolkit.ODESystem(eq,a,[v1,v2],[],tspan=(aL,amax))
+sos = ModelingToolkit.structural_simplify(os)
+v1a = sos.v1ˍa
+op = ModelingToolkit.ODEProblem(sos, [v1a => du(y[1] + r*a)], (aL,amax))
+prob = ModelingToolkit.DAEProblem(os, [v1 => 1, v2 => 2, Da(v1)=>du(y[1]+r*aL),
+Da(v2)=>du(y[2]+r*aL)], (aL,amax), [v1, v2])
+```
